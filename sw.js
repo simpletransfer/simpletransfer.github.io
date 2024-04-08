@@ -1,172 +1,143 @@
-// This will prevent the sw from restarting
-let keepAlive = () => {
-  keepAlive = () => {};
-  var ping = location.href.substr(0, location.href.lastIndexOf("/")) + "/ping";
-  var interval = setInterval(() => {
-    if (sw) {
-      sw.postMessage("ping");
-    } else {
-      fetch(ping).then((res) => res.text(!res.ok && clearInterval(interval)));
-    }
-  }, 10000);
+/* global self ReadableStream Response */
+
+self.addEventListener("install", () => {
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+const map = new Map();
+
+// This should be called once per download
+// Each event has a dataChannel that the data will be piped through
+self.onmessage = (event) => {
+  // We send a heartbeat every x second to keep the
+  // service worker alive if a transferable stream is not sent
+  if (event.data === "ping") {
+    return;
+  }
+
+  const data = event.data;
+  const downloadUrl =
+    data.url ||
+    self.registration.scope +
+      Math.random() +
+      "/" +
+      (typeof data === "string" ? data : data.filename);
+  const port = event.ports[0];
+  const metadata = new Array(3); // [stream, data, port]
+
+  metadata[1] = data;
+  metadata[2] = port;
+
+  // Note to self:
+  // old streamsaver v1.2.0 might still use `readableStream`...
+  // but v2.0.0 will always transfer the stream through MessageChannel #94
+  if (event.data.readableStream) {
+    metadata[0] = event.data.readableStream;
+  } else if (event.data.transferringReadable) {
+    port.onmessage = (evt) => {
+      port.onmessage = null;
+      metadata[0] = evt.data.readableStream;
+    };
+  } else {
+    metadata[0] = createStream(port);
+  }
+
+  map.set(downloadUrl, metadata);
+  port.postMessage({ download: downloadUrl });
 };
 
-// message event is the first thing we need to setup a listner for
-// don't want the opener to do a random timeout - instead they can listen for
-// the ready event
-// but since we need to wait for the Service Worker registration, we store the
-// message for later
-let messages = [];
-window.onmessage = (evt) => messages.push(evt);
+function createStream(port) {
+  // ReadableStream is only supported by chrome 52
+  return new ReadableStream({
+    start(controller) {
+      // When we receive data on the messageChannel, we write
+      port.onmessage = ({ data }) => {
+        if (data === "end") {
+          return controller.close();
+        }
 
-let sw = null;
-let scope = "";
+        if (data === "abort") {
+          controller.error("Aborted the download");
+          return;
+        }
 
-function registerWorker() {
-  return navigator.serviceWorker
-    .getRegistration("./")
-    .then((swReg) => {
-      return (
-        swReg || navigator.serviceWorker.register("sw.js", { scope: "./" })
-      );
-    })
-    .then((swReg) => {
-      const swRegTmp = swReg.installing || swReg.waiting;
-
-      scope = swReg.scope;
-
-      return (
-        (sw = swReg.active) ||
-        new Promise((resolve) => {
-          swRegTmp.addEventListener(
-            "statechange",
-            (fn = () => {
-              if (swRegTmp.state === "activated") {
-                swRegTmp.removeEventListener("statechange", fn);
-                sw = swReg.active;
-                resolve();
-              }
-            })
-          );
-        })
-      );
-    });
-}
-
-// Now that we have the Service Worker registered we can process messages
-function onMessage(event) {
-  let { data, ports, origin } = event;
-
-  // It's important to have a messageChannel, don't want to interfere
-  // with other simultaneous downloads
-  if (!ports || !ports.length) {
-    throw new TypeError("[StreamSaver] You didn't send a messageChannel");
-  }
-
-  if (typeof data !== "object") {
-    throw new TypeError("[StreamSaver] You didn't send a object");
-  }
-
-  // the default public service worker for StreamSaver is shared among others.
-  // so all download links needs to be prefixed to avoid any other conflict
-  data.origin = origin;
-
-  // if we ever (in some feature versoin of streamsaver) would like to
-  // redirect back to the page of who initiated a http request
-  data.referrer = data.referrer || document.referrer || origin;
-
-  // pass along version for possible backwards compatibility in sw.js
-  data.streamSaverVersion = new URLSearchParams(location.search).get("version");
-
-  if (data.streamSaverVersion === "1.2.0") {
-    console.warn("[StreamSaver] please update streamsaver");
-  }
-
-  /** @since v2.0.0 */
-  if (!data.headers) {
-    console.warn(
-      "[StreamSaver] pass `data.headers` that you would like to pass along to the service worker\nit should be a 2D array or a key/val object that fetch's Headers api accepts"
-    );
-  } else {
-    // test if it's correct
-    // should thorw a typeError if not
-    new Headers(data.headers);
-  }
-
-  /** @since v2.0.0 */
-  if (typeof data.filename === "string") {
-    console.warn(
-      "[StreamSaver] You shouldn't send `data.filename` anymore. It should be included in the Content-Disposition header option"
-    );
-    // Do what File constructor do with fileNames
-    data.filename = data.filename.replace(/\//g, ":");
-  }
-
-  /** @since v2.0.0 */
-  if (data.size) {
-    console.warn(
-      "[StreamSaver] You shouldn't send `data.size` anymore. It should be included in the content-length header option"
-    );
-  }
-
-  /** @since v2.0.0 */
-  if (data.readableStream) {
-    console.warn(
-      "[StreamSaver] You should send the readableStream in the messageChannel, not throught mitm"
-    );
-  }
-
-  /** @since v2.0.0 */
-  if (!data.pathname) {
-    console.warn(
-      "[StreamSaver] Please send `data.pathname` (eg: /pictures/summer.jpg)"
-    );
-    data.pathname = Math.random().toString().slice(-6) + "/" + data.filename;
-  }
-
-  // remove all leading slashes
-  data.pathname = data.pathname.replace(/^\/+/g, "");
-
-  // remove protocol
-  let org = origin.replace(/(^\w+:|^)\/\//, "");
-
-  // set the absolute pathname to the download url.
-  data.url = new URL(`${scope + org}/${data.pathname}`).toString();
-
-  if (!data.url.startsWith(`${scope + org}/`)) {
-    throw new TypeError("[StreamSaver] bad `data.pathname`");
-  }
-
-  // This sends the message data as well as transferring
-  // messageChannel.port2 to the service worker. The service worker can
-  // then use the transferred port to reply via postMessage(), which
-  // will in turn trigger the onmessage handler on messageChannel.port1.
-
-  const transferable = data.readableStream
-    ? [ports[0], data.readableStream]
-    : [ports[0]];
-
-  if (!(data.readableStream || data.transferringReadable)) {
-    keepAlive();
-  }
-
-  return sw.postMessage(data, transferable);
-}
-
-if (window.opener) {
-  // The opener can't listen to onload event, so we need to help em out!
-  // (telling them that we are ready to accept postMessage's)
-  window.opener.postMessage("StreamSaver::loadedPopup", "*");
-}
-
-if (navigator.serviceWorker) {
-  registerWorker().then(() => {
-    window.onmessage = onMessage;
-    messages.forEach(window.onmessage);
+        controller.enqueue(data);
+      };
+    },
+    cancel(reason) {
+      console.log("user aborted", reason);
+      port.postMessage({ abort: true });
+    },
   });
 }
 
-// FF v102 just started to supports transferable streams, but still needs to ping sw.js
-// even tough the service worker dose not have to do any kind of work and listen to any
-// messages... #305
-keepAlive();
+self.onfetch = (event) => {
+  const url = event.request.url;
+
+  // this only works for Firefox
+  if (url.endsWith("/ping")) {
+    return event.respondWith(new Response("pong"));
+  }
+
+  const hijacke = map.get(url);
+
+  if (!hijacke) return null;
+
+  const [stream, data, port] = hijacke;
+
+  map.delete(url);
+
+  // Not comfortable letting any user control all headers
+  // so we only copy over the length & disposition
+  const responseHeaders = new Headers({
+    "Content-Type": "application/octet-stream; charset=utf-8",
+
+    // To be on the safe side, The link can be opened in a iframe.
+    // but octet-stream should stop it.
+    "Content-Security-Policy": "default-src 'none'",
+    "X-Content-Security-Policy": "default-src 'none'",
+    "X-WebKit-CSP": "default-src 'none'",
+    "X-XSS-Protection": "1; mode=block",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+  });
+
+  let headers = new Headers(data.headers || {});
+
+  if (headers.has("Content-Length")) {
+    responseHeaders.set("Content-Length", headers.get("Content-Length"));
+  }
+
+  if (headers.has("Content-Disposition")) {
+    responseHeaders.set(
+      "Content-Disposition",
+      headers.get("Content-Disposition")
+    );
+  }
+
+  // data, data.filename and size should not be used anymore
+  if (data.size) {
+    console.warn("Depricated");
+    responseHeaders.set("Content-Length", data.size);
+  }
+
+  let fileName = typeof data === "string" ? data : data.filename;
+  if (fileName) {
+    console.warn("Depricated");
+    // Make filename RFC5987 compatible
+    fileName = encodeURIComponent(fileName)
+      .replace(/['()]/g, escape)
+      .replace(/\*/g, "%2A");
+    responseHeaders.set(
+      "Content-Disposition",
+      "attachment; filename*=UTF-8''" + fileName
+    );
+  }
+
+  event.respondWith(new Response(stream, { headers: responseHeaders }));
+
+  port.postMessage({ debug: "Download started" });
+};
